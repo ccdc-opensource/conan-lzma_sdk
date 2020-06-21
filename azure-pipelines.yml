@@ -1,18 +1,102 @@
-resources:
-  repositories:
-    - repository: templates
-      type: git
-      name: ccdc-3rd-party/conan-azure-devops
-      ref: refs/heads/development
+# This is a *special* package, it breaks a dependency cycle where the 7zip sources
+# *require 7zip* to extract themselves (facepalm...)
+# To break the cycle, we rely on some sort of bash to be there already...
+# hence we provide the CONAN_BASH_PATH environment variable
+# which is not supported by the main templates.
 
-extends:
-  template: third-party-library-all-platforms-from-conan-center.yml@templates
-  parameters:
-    package: lzma_sdk
-    package_version: 9.20
-    source_repository: public-conan-center
-    destination_repository: ccdc-3rdparty-conan
-    build_types:
-      - Release
-    platforms:
-      - win2019_vs2019
+variables:
+  package: lzma_sdk
+  package_version: 9.20
+  source_repository: public-conan-center
+  destination_repository: ccdc-3rdparty-conan
+
+jobs:
+- job: build_lzma_sdk
+  pool:
+    vmImage: "windows-2019"
+  steps:
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: "3.8"
+      displayName: "Use latest python 3.8"
+
+    - script: python -m pip install --upgrade conan
+      displayName: 'Install conan'
+
+    - task: ArtifactoryGenericDownload@3
+      displayName: 'Download configuration'
+      inputs:
+        connection: 'devops-ccdc-3rd-party'
+        specSource: 'taskConfiguration'
+        fileSpec: |
+          {
+            "files": [
+              {
+                "pattern": "ccdc-conan-metadata/common-3rdparty-config.zip",
+                "target": "$(Pipeline.Workspace)/.conan/"
+              }
+            ]
+          }
+        failNoOp: true
+
+    - task: ArtifactoryConan@1
+      displayName: 'Install configuration'
+      inputs:
+        conanCommand: 'Config Install'
+        configSourceType: 'zip'
+        configZipPath: '$(Pipeline.Workspace)/.conan/common-3rdparty-config.zip'
+        conanUserHome: '$(Pipeline.Workspace)/.conan'
+
+    - task: ArtifactoryConan@1
+      displayName: 'Use $(destination_repository)'
+      inputs:
+        conanCommand: 'Add Remote'
+        remoteName: '$(destination_repository)'
+        artifactoryService: 'devops-ccdc-3rd-party'
+        conanRepo: '$(destination_repository)'
+        purgeExistingRemotes: true
+        conanUserHome: '$(Pipeline.Workspace)/.conan'
+
+    - task: ArtifactoryConan@1
+      displayName: 'Use $(source_repository)'
+      inputs:
+        conanCommand: 'Add Remote'
+        remoteName: '$(source_repository)'
+        artifactoryService: 'devops-ccdc-3rd-party'
+        conanRepo: '$(source_repository)'
+        purgeExistingRemotes: false
+        conanUserHome: '$(Pipeline.Workspace)/.conan'
+
+    # Download just this package from the source repository, dependencies must already be built in the destination
+    - task: ArtifactoryConan@1
+      displayName: 'Download $(package)/$(package_version)@'
+      inputs:
+        conanCommand: 'Custom'
+        customArguments: 'download $(package)/$(package_version)@ --remote=$(source_repository) --recipe'
+        buildName: '$(Build.DefinitionName)'
+        buildNumber: '$(Build.BuildNumber)'
+        conanUserHome: '$(Pipeline.Workspace)/.conan'
+
+    # We only build on windows, in Release mode
+    - task: ArtifactoryConan@1
+      displayName: 'Build $(package) in Release mode'
+      inputs:
+        conanCommand: 'Install'
+        pathOrReference: '$(package)/$(package_version)@'
+        # We build a single package, on purpose, dependencies must be tracked
+        extraArguments: '--profile windows-msvc16-amd64-release --remote=$(destination_repository) --build=$(package) -s build_type=Release'
+        buildName: '$(Build.DefinitionName)'
+        buildNumber: '$(Build.BuildNumber)'
+        conanUserHome: '$(Pipeline.Workspace)/.conan'
+      env:
+        CONAN_BASH_PATH: 'C:\Program Files\Git\bin\bash.exe'
+
+    - task: ArtifactoryConan@1
+      displayName: 'Upload $(package)/$(package_version)@'
+      inputs:
+        conanCommand: 'Upload'
+        patternOrReference: '$(package)/$(package_version)@'
+        extraArguments: '--all --remote=$(destination_repository)'
+        buildName: '$(Build.DefinitionName)'
+        buildNumber: '$(Build.BuildNumber)'
+        conanUserHome: '$(Pipeline.Workspace)/.conan'
